@@ -4917,7 +4917,6 @@ late_initcall(sched_core_sysctl_init);
  */
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
-
 #ifdef CONFIG_HMBIRD_SCHED
 	int ret;
 #endif
@@ -4973,7 +4972,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		p->sched_class = &hmbird_sched_class;
 	} else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
-	else
+	} else {
 		p->sched_class = &fair_sched_class;
 	}
 #else
@@ -6291,6 +6290,7 @@ restart:
 		if (p) {
 			hmbird_notify_pick_next_task(rq, p, class);
 			return p;
+		}
 	}
 #else
 	for_each_class(class) {
