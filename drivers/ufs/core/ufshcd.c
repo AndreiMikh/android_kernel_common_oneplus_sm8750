@@ -2886,6 +2886,13 @@ static void ufshcd_panic_poll(struct ufs_hba *hba, int tag, struct scsi_cmnd *cm
 	int i;
 	u32 doorbell;
 	bool completed = false;
+	
+	/* 仅输出一次警告，避免刷屏 */
+	static bool logged = false;
+	if (!logged) {
+		pr_emerg("phy-dump: UFS panic poll trigger! Tag: %d\n", tag);
+		logged = true;
+	}
 
 	for (i = 0; i < UFS_PANIC_POLL_RETRIES; i++) {
 		/* 读取 Doorbell 寄存器 */
@@ -2902,6 +2909,7 @@ static void ufshcd_panic_poll(struct ufs_hba *hba, int tag, struct scsi_cmnd *cm
 		set_host_byte(cmd, DID_OK);
 		scsi_done(cmd); /* 手动触发 SCSI 完成回调 */
 	} else {
+		pr_emerg("phy-dump: UFS poll timed out! Tag: %d\n", tag);
 		set_host_byte(cmd, DID_TIME_OUT);
 		scsi_done(cmd);
 	}

@@ -12,7 +12,7 @@
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/version.h>
-#include <linux/kmsg_dump.h> /* 用于触发 kmsg_dump */
+#include <linux/kmsg_dump.h>
 #include <linux/phy/phy-dump.h>
 
 #ifdef CONFIG_PSTORE_BLK
@@ -82,6 +82,7 @@ static int try_hijack_partition(const char *base_name, const char *suffix, char 
 	else
 		snprintf(path, sizeof(path), "PARTLABEL=%s", base_name);
 
+	pr_info("Probing %s ...\n", path);
 	ret = compat_open_bdev(path, &g_hijack);
 	if (ret) {
 		/* 回退到 /dev 路径 (Late init 可能会用到) */
@@ -90,15 +91,19 @@ static int try_hijack_partition(const char *base_name, const char *suffix, char 
 		else
 			snprintf(path, sizeof(path), "/dev/block/by-name/%s", base_name);
 		
+		pr_info("PARTLABEL failed, fallback to %s ...\n", path);
 		ret = compat_open_bdev(path, &g_hijack);
-		if (ret) return ret;
+		if (ret) {
+			pr_info("Failed to open %s (err=%d)\n", path, ret);
+			return ret;
+		}
 	}
 
 	capacity = bdev_nr_sectors(g_hijack.bdev);
 	needed = (PSTORE_TARGET_SIZE + AVB_SAFETY_MARGIN) >> SECTOR_SHIFT;
 
 	if (capacity <= needed) {
-		pr_warn("phy-dump: %s too small\n", path);
+		pr_warn("Target %s too small: %llu sectors < %llu needed\n", path, capacity, needed);
 		compat_close_bdev(&g_hijack);
 		return -ENOSPC;
 	}
@@ -107,26 +112,31 @@ static int try_hijack_partition(const char *base_name, const char *suffix, char 
 	g_hijack.active = true;
 
 	if (out_path) strscpy(out_path, path, path_len);
-	pr_info("phy-dump: HIJACKED %s (Offset: %llu)\n", path, g_hijack.start_sector);
+	pr_info("HIJACK SUCCESS -> %s\n", path);
+	pr_info("Dump Area: Start Sector %llu, Size 4MB (Safety Margin 512KB)\n", g_hijack.start_sector);
 	return 0;
 }
 
 void phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 {
 	const char *suffix = get_inactive_suffix();
+	pr_info("Initializing... Slot Suffix: %s\n", suffix ? suffix : "(none)");
 	if (suffix) {
 		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) return;
 		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) return;
 		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) return;
 	}
 	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) return;
-	pr_err("phy-dump: All attempts failed.\n");
+	pr_err("ALL HIJACK ATTEMPTS FAILED. Physical dump disabled.\n");
 }
 EXPORT_SYMBOL_GPL(phy_dump_init_hijack);
 
 void phy_dump_exit_hijack(void)
 {
-	if (g_hijack.active) compat_close_bdev(&g_hijack);
+	if (g_hijack.active) {
+		compat_close_bdev(&g_hijack);
+		pr_info("Hijack released.\n");
+	}
 }
 EXPORT_SYMBOL_GPL(phy_dump_exit_hijack);
 
@@ -136,7 +146,7 @@ EXPORT_SYMBOL_GPL(phy_dump_exit_hijack);
 void phy_dump_panic_pre_stop(void)
 {
 	if (g_hijack.active && oops_in_progress) {
-		pr_emerg("phy-dump: Triggering early kmsg dump before SMP stop...\n");
+		pr_emerg("PANIC DETECTED! Triggering early kmsg_dump before SMP stop...\n");
 		/* * 触发标准的 kmsg_dump，这会回调 pstore 的 write 接口。
 		 * 由于我们已经在下面 phy_dump_write 中实现了 Bypass VFS 逻辑，
 		 * 这将直接导致数据通过 RAW BIO 写入磁盘。
@@ -155,6 +165,10 @@ ssize_t phy_dump_read(struct file *file, char *buf, size_t bytes, loff_t pos)
 	/* 逻辑：如果劫持激活，叠加物理偏移 */
 	if (g_hijack.active) {
 		hijacked_pos += (g_hijack.start_sector << SECTOR_SHIFT);
+		/* 仅在读取头部时输出日志，验证系统是否识别到了转储日志 */
+		if (pos == 0)
+			pr_info("System reading dump header at phys sector %llu (size %zu)\n", 
+				(u64)(g_hijack.start_sector), bytes);
 	}
 	
 	/* 无论是否劫持，最终都调用 kernel_read。
@@ -172,7 +186,10 @@ static int submit_raw_bio(int op, sector_t sector, void *data, size_t len)
 	if (!g_hijack.bdev) return -ENODEV;
 
 	bio = bio_alloc(g_hijack.bdev, 1, op | REQ_SYNC | REQ_META | REQ_PRIO, GFP_ATOMIC);
-	if (!bio) return -ENOMEM;
+	if (!bio) {
+		pr_emerg("Failed to allocate atomic BIO for sector %llu\n", (u64)sector);
+		return -ENOMEM;
+	}
 
 	bio->bi_iter.bi_sector = sector;
 
@@ -181,18 +198,20 @@ static int submit_raw_bio(int op, sector_t sector, void *data, size_t len)
 			page = vmalloc_to_page(data);
 		else
 			page = virt_to_page(data);
-		if (!bio_add_page(bio, page, len, offset_in_page(data))) {
+		if (bio_add_page(bio, page, len, offset_in_page(data)) != len) {
+			pr_emerg("BIO add page failed for len %zu\n", len);
 			bio_put(bio);
 			return -EIO;
 		}
 	}
-	submit_bio(bio); /* 触发 UFS Polling */
+	submit_bio(bio); /* 触发 UFS轮询 */
 	return 0;
 }
 
 static void psblk_panic_wipe_header(void)
 {
 	static char zero_buf[4096] = {0}; 
+	pr_emerg("Wiping dump header at sector %llu...\n", (u64)g_hijack.start_sector);
 	submit_raw_bio(REQ_OP_WRITE, g_hijack.start_sector, zero_buf, 4096);
 }
 
@@ -202,9 +221,17 @@ ssize_t phy_dump_write(struct file *file, const char *buf, size_t bytes, loff_t 
 	if (in_interrupt() || irqs_disabled() || oops_in_progress) {
 		if (g_hijack.active) {
 			sector_t phys_sector = g_hijack.start_sector + (pos >> SECTOR_SHIFT);
-			if (pos == 0) psblk_panic_wipe_header();
-			if (submit_raw_bio(REQ_OP_WRITE, phys_sector, (void *)buf, bytes) == 0)
+			if (pos == 0) {
+				pr_emerg("Panic write started. Target: Sector %llu\n", (u64)phys_sector);
+				psblk_panic_wipe_header();
+			}
+			if (submit_raw_bio(REQ_OP_WRITE, phys_sector, (void *)buf, bytes) == 0) {
+				/* 调试日志：仅在写入非0偏移或特定大小时输出，避免过多刷屏 */
+				if (pos == 0 || pos % (1024*1024) == 0)
+					pr_emerg("Wrote %zu bytes to sector %llu\n", bytes, (u64)phys_sector);
 				return bytes;
+			}
+			pr_emerg("Raw write failed at sector %llu\n", (u64)phys_sector);
 		}
 		return -EBUSY; /* 劫持失败且在中断中，无法写入 */
 	}
