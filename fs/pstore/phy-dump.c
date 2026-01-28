@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Physical Dump Helper for Android Pstore
+ */
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/blkdev.h>
+#include <linux/bio.h>
+#include <linux/file.h>
+#include <linux/uio.h>
+#include <linux/vmalloc.h>
+#include <linux/mm.h>
+#include <linux/string.h>
+#include <linux/version.h>
+#include <linux/kmsg_dump.h> /* 用于触发 kmsg_dump */
+#include <linux/phy/phy-dump.h>
+
+#ifdef CONFIG_PSTORE_BLK
+
+#define PSTORE_TARGET_SIZE   (4 * 1024 * 1024)
+#define AVB_SAFETY_MARGIN    (512 * 1024)
+#define SECTOR_SHIFT         9
+
+struct pstore_hijack_ctx {
+	struct block_device *bdev;
+	struct file *file;
+	void *holder;
+	sector_t start_sector;
+	bool active;
+};
+
+static struct pstore_hijack_ctx g_hijack = {0};
+extern char *saved_command_line;
+
+/* ================== 兼容性层 ================== */
+static int compat_open_bdev(const char *path, struct pstore_hijack_ctx *ctx)
+{
+	memset(ctx, 0, sizeof(*ctx));
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	struct file *f = bdev_file_open_by_path(path, BLK_OPEN_READ | BLK_OPEN_WRITE, ctx, NULL);
+	if (IS_ERR(f)) return PTR_ERR(f);
+	ctx->file = f;
+	ctx->bdev = file_bdev(f);
+#else
+	struct block_device *bdev = blkdev_get_by_path(path, FMODE_READ | FMODE_WRITE, ctx);
+	if (IS_ERR(bdev)) return PTR_ERR(bdev);
+	ctx->bdev = bdev;
+	ctx->holder = ctx;
+#endif
+	return 0;
+}
+
+static void compat_close_bdev(struct pstore_hijack_ctx *ctx)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	if (ctx->file) fput(ctx->file);
+#else
+	if (ctx->bdev) blkdev_put(ctx->bdev, ctx->holder);
+#endif
+	ctx->bdev = NULL;
+	ctx->active = false;
+}
+
+/* ================== 分区探测逻辑 ================== */
+static const char* get_inactive_suffix(void)
+{
+	if (!saved_command_line) return NULL;
+	if (strstr(saved_command_line, "androidboot.slot_suffix=_a")) return "_b";
+	if (strstr(saved_command_line, "androidboot.slot_suffix=_b")) return "_a";
+	return NULL;
+}
+
+static int try_hijack_partition(const char *base_name, const char *suffix, char *out_path, size_t path_len)
+{
+	char path[128];
+	int ret;
+	sector_t capacity, needed;
+
+	/* 优先使用 PARTLABEL (内核级查找，无需 /dev 链接) */
+	if (suffix)
+		snprintf(path, sizeof(path), "PARTLABEL=%s%s", base_name, suffix);
+	else
+		snprintf(path, sizeof(path), "PARTLABEL=%s", base_name);
+
+	ret = compat_open_bdev(path, &g_hijack);
+	if (ret) {
+		/* 回退到 /dev 路径 (Late init 可能会用到) */
+		if (suffix)
+			snprintf(path, sizeof(path), "/dev/block/by-name/%s%s", base_name, suffix);
+		else
+			snprintf(path, sizeof(path), "/dev/block/by-name/%s", base_name);
+		
+		ret = compat_open_bdev(path, &g_hijack);
+		if (ret) return ret;
+	}
+
+	capacity = bdev_nr_sectors(g_hijack.bdev);
+	needed = (PSTORE_TARGET_SIZE + AVB_SAFETY_MARGIN) >> SECTOR_SHIFT;
+
+	if (capacity <= needed) {
+		pr_warn("phy-dump: %s too small\n", path);
+		compat_close_bdev(&g_hijack);
+		return -ENOSPC;
+	}
+
+	g_hijack.start_sector = capacity - needed;
+	g_hijack.active = true;
+
+	if (out_path) strscpy(out_path, path, path_len);
+	pr_info("phy-dump: HIJACKED %s (Offset: %llu)\n", path, g_hijack.start_sector);
+	return 0;
+}
+
+void phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
+{
+	const char *suffix = get_inactive_suffix();
+	if (suffix) {
+		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) return;
+		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) return;
+		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) return;
+	}
+	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) return;
+	pr_err("phy-dump: All attempts failed.\n");
+}
+EXPORT_SYMBOL_GPL(phy_dump_init_hijack);
+
+void phy_dump_exit_hijack(void)
+{
+	if (g_hijack.active) compat_close_bdev(&g_hijack);
+}
+EXPORT_SYMBOL_GPL(phy_dump_exit_hijack);
+
+/* ================== Panic Hook ================== */
+
+/* 在 panic() 调用 smp_send_stop() 之前调用此函数 */
+void phy_dump_panic_pre_stop(void)
+{
+	if (g_hijack.active && oops_in_progress) {
+		pr_emerg("phy-dump: Triggering early kmsg dump before SMP stop...\n");
+		/* * 触发标准的 kmsg_dump，这会回调 pstore 的 write 接口。
+		 * 由于我们已经在下面 phy_dump_write 中实现了 Bypass VFS 逻辑，
+		 * 这将直接导致数据通过 RAW BIO 写入磁盘。
+		 */
+		kmsg_dump(KMSG_DUMP_PANIC);
+	}
+}
+EXPORT_SYMBOL_GPL(phy_dump_panic_pre_stop);
+
+/* ================== 读写逻辑 ================== */
+
+ssize_t phy_dump_read(struct file *file, char *buf, size_t bytes, loff_t pos)
+{
+	loff_t hijacked_pos = pos;
+	
+	/* 逻辑：如果劫持激活，叠加物理偏移 */
+	if (g_hijack.active) {
+		hijacked_pos += (g_hijack.start_sector << SECTOR_SHIFT);
+	}
+	
+	/* 无论是否劫持，最终都调用 kernel_read。
+	 * 如果没劫持，target_pos == pos，行为与原 blk.c 一致。
+	 */
+	return kernel_read(file, buf, bytes, &hijacked_pos);
+}
+EXPORT_SYMBOL_GPL(phy_dump_read);
+
+static int submit_raw_bio(int op, sector_t sector, void *data, size_t len)
+{
+	struct bio *bio;
+	struct page *page;
+	
+	if (!g_hijack.bdev) return -ENODEV;
+
+	bio = bio_alloc(g_hijack.bdev, 1, op | REQ_SYNC | REQ_META | REQ_PRIO, GFP_ATOMIC);
+	if (!bio) return -ENOMEM;
+
+	bio->bi_iter.bi_sector = sector;
+
+	if (data) {
+		if (is_vmalloc_addr(data))
+			page = vmalloc_to_page(data);
+		else
+			page = virt_to_page(data);
+		if (!bio_add_page(bio, page, len, offset_in_page(data))) {
+			bio_put(bio);
+			return -EIO;
+		}
+	}
+	submit_bio(bio); /* 触发 UFS Polling */
+	return 0;
+}
+
+static void psblk_panic_wipe_header(void)
+{
+	static char zero_buf[4096] = {0}; 
+	submit_raw_bio(REQ_OP_WRITE, g_hijack.start_sector, zero_buf, 4096);
+}
+
+ssize_t phy_dump_write(struct file *file, const char *buf, size_t bytes, loff_t pos)
+{
+	/* 逻辑 1: Panic / 中断上下文 -> 必须走 RAW BIO */
+	if (in_interrupt() || irqs_disabled() || oops_in_progress) {
+		if (g_hijack.active) {
+			sector_t phys_sector = g_hijack.start_sector + (pos >> SECTOR_SHIFT);
+			if (pos == 0) psblk_panic_wipe_header();
+			if (submit_raw_bio(REQ_OP_WRITE, phys_sector, (void *)buf, bytes) == 0)
+				return bytes;
+		}
+		return -EBUSY; /* 劫持失败且在中断中，无法写入 */
+	}
+
+	/* 逻辑 2: 正常上下文 -> 走 VFS */
+	loff_t hijacked_pos = pos;
+	if (g_hijack.active) {
+		hijacked_pos += (g_hijack.start_sector << SECTOR_SHIFT);
+	}
+	
+	/* 回退到 kernel_write，保持与原 blk.c 一致 */
+	return kernel_write(file, buf, bytes, &hijacked_pos);
+}
+EXPORT_SYMBOL_GPL(phy_dump_write);
+
+#endif /* CONFIG_PSTORE_BLK */

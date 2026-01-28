@@ -37,6 +37,7 @@
 #include <linux/context_tracking.h>
 #include <trace/events/error_report.h>
 #include <asm/sections.h>
+#include <linux/phy/phy-dump.h>
 
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
@@ -365,6 +366,10 @@ void panic(const char *fmt, ...)
 	 * add information to the kmsg dump output.
 	 */
 	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
+
+#ifdef CONFIG_PSTORE_BLK
+	phy_dump_panic_pre_stop();
+#endif
 
 	panic_print_sys_info(false);
 

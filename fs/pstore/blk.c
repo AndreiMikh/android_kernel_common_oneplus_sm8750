@@ -19,6 +19,8 @@
 #include <linux/init_syscalls.h>
 #include <linux/mount.h>
 
+#include <linux/phy/phy-dump.h>
+
 static long kmsg_size = CONFIG_PSTORE_BLK_KMSG_SIZE;
 module_param(kmsg_size, long, 0400);
 MODULE_PARM_DESC(kmsg_size, "kmsg dump record size in kbytes");
@@ -187,16 +189,24 @@ EXPORT_SYMBOL_GPL(unregister_pstore_device);
 
 static ssize_t psblk_generic_blk_read(char *buf, size_t bytes, loff_t pos)
 {
+#ifdef CONFIG_PSTORE_BLK
+	return phy_dump_read(psblk_file, buf, bytes, pos);
+#else
 	return kernel_read(psblk_file, buf, bytes, &pos);
+#endif
 }
 
 static ssize_t psblk_generic_blk_write(const char *buf, size_t bytes,
 		loff_t pos)
 {
+#ifdef CONFIG_PSTORE_BLK
+	return phy_dump_write(psblk_file, buf, bytes, pos);
+#else
 	/* Console/Ftrace backend may handle buffer until flush dirty zones */
 	if (in_interrupt() || irqs_disabled())
 		return -EBUSY;
 	return kernel_write(psblk_file, buf, bytes, &pos);
+#endif
 }
 
 /*
@@ -337,6 +347,13 @@ static int __init pstore_blk_init(void)
 {
 	int ret;
 
+	/* * 修改点：插入 phy_dump_init_hijack。
+	 * 作用：在 pstore 初始化前探测分区，修改 blkdev 变量。
+	 */
+#ifdef CONFIG_PSTORE_BLK
+	phy_dump_init_hijack(blkdev, sizeof(blkdev));
+#endif
+
 	mutex_lock(&pstore_blk_lock);
 	ret = __best_effort_init();
 	mutex_unlock(&pstore_blk_lock);
@@ -351,6 +368,12 @@ static void __exit pstore_blk_exit(void)
 	__best_effort_exit();
 	/* If we've been asked to unload, unregister any remaining device. */
 	__unregister_pstore_device(pstore_device_info);
+	/* * 修改点：插入 phy_dump_exit_hijack。
+	 * 作用：释放劫持时打开的额外设备句柄，防止泄漏。
+	 */
+#ifdef CONFIG_PSTORE_BLK
+	phy_dump_exit_hijack();
+#endif
 	mutex_unlock(&pstore_blk_lock);
 }
 module_exit(pstore_blk_exit);

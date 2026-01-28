@@ -36,6 +36,7 @@
 #include "ufs_bsg.h"
 #include "ufshcd-crypto.h"
 #include <asm/unaligned.h>
+#include <ufs/ufshci.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/ufs.h>
@@ -2873,6 +2874,40 @@ static void ufshcd_init_lrb(struct ufs_hba *hba, struct ufshcd_lrb *lrb, int i)
 	lrb->ucd_prdt_dma_addr = cmd_desc_element_addr + prdt_offset;
 }
 
+#ifdef CONFIG_PSTORE_BLK
+
+#define UFS_PANIC_POLL_RETRIES 10000000
+
+/* * 静态辅助函数：Panic 时的死循环轮询 
+ * 作用：在中断禁用时，手动检查 Doorbell 寄存器位，确认命令完成
+ */
+static void ufshcd_panic_poll(struct ufs_hba *hba, int tag, struct scsi_cmnd *cmd)
+{
+	int i;
+	u32 doorbell;
+	bool completed = false;
+
+	for (i = 0; i < UFS_PANIC_POLL_RETRIES; i++) {
+		/* 读取 Doorbell 寄存器 */
+		doorbell = ufshcd_readl(hba, REG_UTRLDBR_DOOR_BELL);
+		/* 检查对应 tag 位是否清零 (0表示完成) */
+		if (!(doorbell & (1 << tag))) {
+			completed = true;
+			break;
+		}
+		udelay(1); /* 微秒级延迟 */
+	}
+
+	if (completed) {
+		set_host_byte(cmd, DID_OK);
+		scsi_done(cmd); /* 手动触发 SCSI 完成回调 */
+	} else {
+		set_host_byte(cmd, DID_TIME_OUT);
+		scsi_done(cmd);
+	}
+}
+#endif /* CONFIG_PSTORE_BLK */
+
 /**
  * ufshcd_queuecommand - main entry point for SCSI requests
  * @host: SCSI host pointer
@@ -2970,6 +3005,23 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
 	if (err)
 		goto out;
 	ufshcd_send_command(hba, tag, hwq);
+
+#ifdef CONFIG_PSTORE_BLK
+	/* * 在 Panic 且 UFS 还在工作时，立即轮询。
+	* 注意：这段代码必须放在 phy_dump.c 中的 submit_raw_bio 触发之后执行。
+	*/
+	if (unlikely(oops_in_progress)) {
+		/* * 注意：6.6 代码在此处并未持有显式的 RCU 锁，
+		 * 因此不需要像 6.1 那样调用 rcu_read_unlock()，
+		 * 可以直接进入轮询: 
+		 */
+		ufshcd_panic_poll(hba, tag, cmd);
+		/* * 返回 0 告诉 SCSI 层命令已成功入队
+		 * 实际上我们已经在上方 ufshcd_panic_poll 中调用 scsi_done 完成了它
+		 */
+		return 0;
+	}
+#endif
 
 out:
 	if (ufs_trigger_eh()) {
