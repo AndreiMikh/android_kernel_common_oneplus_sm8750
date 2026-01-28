@@ -2896,7 +2896,7 @@ static void ufshcd_panic_poll(struct ufs_hba *hba, int tag, struct scsi_cmnd *cm
 
 	for (i = 0; i < UFS_PANIC_POLL_RETRIES; i++) {
 		/* 读取 Doorbell 寄存器 */
-		doorbell = ufshcd_readl(hba, REG_UTRLDBR_DOOR_BELL);
+		doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
 		/* 检查对应 tag 位是否清零 (0表示完成) */
 		if (!(doorbell & (1 << tag))) {
 			completed = true;

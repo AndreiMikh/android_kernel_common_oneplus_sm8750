@@ -42,7 +42,7 @@ static int compat_open_bdev(const char *path, struct pstore_hijack_ctx *ctx)
 	ctx->file = f;
 	ctx->bdev = file_bdev(f);
 #else
-	struct block_device *bdev = blkdev_get_by_path(path, FMODE_READ | FMODE_WRITE, ctx);
+	struct block_device *bdev = blkdev_get_by_path(path, FMODE_READ | FMODE_WRITE, ctx, NULL);
 	if (IS_ERR(bdev)) return PTR_ERR(bdev);
 	ctx->bdev = bdev;
 	ctx->holder = ctx;
