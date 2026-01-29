@@ -13,6 +13,8 @@
 #include <linux/string.h>
 #include <linux/version.h>
 #include <linux/kmsg_dump.h>
+#include <linux/bootconfig.h>
+#include <linux/of.h>
 #include <linux/phy/phy-dump.h>
 
 #ifdef CONFIG_PSTORE_BLK
@@ -62,11 +64,120 @@ static void compat_close_bdev(struct pstore_hijack_ctx *ctx)
 }
 
 /* ================== 分区探测逻辑 ================== */
+/* 1. 从 Bootconfig (XBC) 获取 - [针对 Android 12+ GKI] */
+static const char *get_suffix_from_bootconfig(void)
+{
+	struct xbc_node *node;
+	const char *val;
+
+	/* 查找 androidboot.slot_suffix (你的机型里是这个) */
+	node = xbc_find_node("androidboot.slot_suffix");
+	if (node) {
+		val = xbc_node_get_data(node);
+		if (val) return val;
+	}
+
+	/* 查找 androidboot.slot (兼容写法) */
+	node = xbc_find_node("androidboot.slot");
+	if (node) {
+		val = xbc_node_get_data(node);
+		if (val) return val;
+	}
+
+	return NULL;
+}
+
+/* 2. 从 Device Tree /chosen/bootargs 获取 - [针对 Bootloader 传递方式差异] */
+static const char *get_suffix_from_dt_chosen(void)
+{
+	struct device_node *np;
+	const char *bootargs = NULL;
+	const char *ret = NULL;
+
+	np = of_find_node_by_path("/chosen");
+	if (!np) return NULL;
+
+	if (of_property_read_string(np, "bootargs", &bootargs) == 0 && bootargs) {
+		if (strstr(bootargs, "androidboot.slot_suffix=_a") || 
+			strstr(bootargs, "androidboot.slot=_a")) {
+			ret = "_a";
+		} else if (strstr(bootargs, "androidboot.slot_suffix=_b") || 
+				   strstr(bootargs, "androidboot.slot=_b")) {
+			ret = "_b";
+		}
+	}
+	of_node_put(np);
+	return ret;
+}
+
+/* 3. 从 Qualcomm 专有 DT 节点获取 - [针对旧高通平台] */
+static const char *get_suffix_from_dt_firmware(void)
+{
+	struct device_node *np;
+	const char *suffix = NULL;
+
+	np = of_find_node_by_path("/firmware/android");
+	if (np) {
+		of_property_read_string(np, "slot_suffix", &suffix);
+		of_node_put(np);
+	}
+	return suffix;
+}
+
+/* [主函数] 综合获取非活动槽位后缀 */
 static const char* get_inactive_suffix(void)
 {
-	if (!saved_command_line) return NULL;
-	if (strstr(saved_command_line, "androidboot.slot_suffix=_a")) return "_b";
-	if (strstr(saved_command_line, "androidboot.slot_suffix=_b")) return "_a";
+	const char *active_suffix = NULL;
+	const char *source = "unknown";
+
+	/* 优先级 1: Bootconfig (你的机型验证通过) */
+	active_suffix = get_suffix_from_bootconfig();
+	if (active_suffix) {
+		source = "bootconfig";
+		goto found;
+	}
+
+	/* 优先级 2: Kernel Command Line (传统) */
+	if (saved_command_line) {
+		if (strstr(saved_command_line, "androidboot.slot_suffix=_a") || 
+			strstr(saved_command_line, "androidboot.slot=_a")) {
+			active_suffix = "_a";
+			source = "cmdline";
+			goto found;
+		}
+		if (strstr(saved_command_line, "androidboot.slot_suffix=_b") || 
+			strstr(saved_command_line, "androidboot.slot=_b")) {
+			active_suffix = "_b";
+			source = "cmdline";
+			goto found;
+		}
+	}
+
+	/* 优先级 3: Device Tree /chosen */
+	active_suffix = get_suffix_from_dt_chosen();
+	if (active_suffix) {
+		source = "dt_chosen";
+		goto found;
+	}
+
+	/* 优先级 4: Device Tree /firmware/android */
+	active_suffix = get_suffix_from_dt_firmware();
+	if (active_suffix) {
+		source = "dt_firmware";
+		goto found;
+	}
+
+	return NULL;
+
+found:
+	/* 打印详细日志，确认来源 */
+	pr_info("Active slot '%s' found via %s\n", active_suffix, source);
+	
+	/* 去除可能存在的引号 (bootconfig 有时会带引号) */
+	if (strstr(active_suffix, "_a")) return "_b";
+	if (strstr(active_suffix, "_b")) return "_a";
+	
+	pr_warn("Unknown slot format: %s\n", active_suffix);
 	return NULL;
 }
 
@@ -122,6 +233,7 @@ void phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 	const char *suffix = get_inactive_suffix();
 	pr_info("Initializing... Slot Suffix: %s\n", suffix ? suffix : "(none)");
 	if (suffix) {
+		pr_info("Targeting Inactive Slot: %s\n", suffix);
 		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) return;
 		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) return;
 		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) return;
