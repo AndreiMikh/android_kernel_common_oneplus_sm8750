@@ -65,7 +65,7 @@ static void compat_close_bdev(struct pstore_hijack_ctx *ctx)
 
 /* ================== 分区探测逻辑 ================== */
 /* 1. 从 Bootconfig (XBC) 获取 - [针对 Android 12+ GKI] */
-static const char *get_suffix_from_bootconfig(void)
+static const char * __init get_suffix_from_bootconfig(void)
 {
 	struct xbc_node *node;
 	const char *val;
@@ -88,7 +88,7 @@ static const char *get_suffix_from_bootconfig(void)
 }
 
 /* 2. 从 Device Tree /chosen/bootargs 获取 - [针对 Bootloader 传递方式差异] */
-static const char *get_suffix_from_dt_chosen(void)
+static const char * __init get_suffix_from_dt_chosen(void)
 {
 	struct device_node *np;
 	const char *bootargs = NULL;
@@ -111,7 +111,7 @@ static const char *get_suffix_from_dt_chosen(void)
 }
 
 /* 3. 从 Qualcomm 专有 DT 节点获取 - [针对旧高通平台] */
-static const char *get_suffix_from_dt_firmware(void)
+static const char * __init get_suffix_from_dt_firmware(void)
 {
 	struct device_node *np;
 	const char *suffix = NULL;
@@ -125,7 +125,7 @@ static const char *get_suffix_from_dt_firmware(void)
 }
 
 /* [主函数] 综合获取非活动槽位后缀 */
-static const char* get_inactive_suffix(void)
+static const char * __init get_inactive_suffix(void)
 {
 	const char *active_suffix = NULL;
 	const char *source = "unknown";
@@ -181,7 +181,7 @@ found:
 	return NULL;
 }
 
-static int try_hijack_partition(const char *base_name, const char *suffix, char *out_path, size_t path_len)
+static int __init try_hijack_partition(const char *base_name, const char *suffix, char *out_path, size_t path_len)
 {
 	char path[128];
 	int ret;
@@ -228,7 +228,7 @@ static int try_hijack_partition(const char *base_name, const char *suffix, char 
 	return 0;
 }
 
-void phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
+void __init phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 {
 	const char *suffix = get_inactive_suffix();
 	pr_info("Initializing... Slot Suffix: %s\n", suffix ? suffix : "(none)");
@@ -241,7 +241,6 @@ void phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) return;
 	pr_err("ALL HIJACK ATTEMPTS FAILED. Physical dump disabled.\n");
 }
-EXPORT_SYMBOL_GPL(phy_dump_init_hijack);
 
 void phy_dump_exit_hijack(void)
 {
