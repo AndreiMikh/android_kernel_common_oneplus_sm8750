@@ -66,6 +66,10 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/module.h>
 
+#ifdef CONFIG_PSTORE_BLK
+#include <linux/phy/phy-dump.h>
+#endif
+
 /*
  * Mutex protects:
  * 1) List of modules (also safely readable with preempt_disable),
@@ -2883,6 +2887,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	bool module_allocated = false;
 	long err = 0;
 	char *after_dashes;
+	
+#ifdef CONFIG_PSTORE_BLK
+	/* * 强制等待 phy-dump 完成初始化（包括 UFS 探测和分区劫持）。
+	* 这保证了没有任何模块能在 Pstore 物理转储准备好之前加载。
+	*/
+	phy_dump_wait_for_ready();
+#endif
 
 	/*
 	 * Do the signature check (if any) first. All that

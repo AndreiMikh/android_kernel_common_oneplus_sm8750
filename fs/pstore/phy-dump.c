@@ -15,6 +15,8 @@
 #include <linux/kmsg_dump.h>
 #include <linux/bootconfig.h>
 #include <linux/of.h>
+#include <linux/delay.h>
+#include <linux/completion.h>
 #include <linux/phy/phy-dump.h>
 
 #ifdef CONFIG_PSTORE_BLK
@@ -22,6 +24,8 @@
 #define PSTORE_TARGET_SIZE   (4 * 1024 * 1024)
 #define AVB_SAFETY_MARGIN    (512 * 1024)
 #define SECTOR_SHIFT         9
+
+static DECLARE_COMPLETION(phy_dump_done);
 
 struct pstore_hijack_ctx {
 	struct block_device *bdev;
@@ -186,6 +190,8 @@ static int __init try_hijack_partition(const char *base_name, const char *suffix
 	char path[128];
 	int ret;
 	sector_t capacity, needed;
+	char target_name[64];
+	int retries = 50; /* [修改点] 设置重试次数：50次 * 100ms = 5秒超时 */
 
 	/* 优先使用 PARTLABEL (内核级查找，无需 /dev 链接) */
 	if (suffix)
@@ -193,7 +199,29 @@ static int __init try_hijack_partition(const char *base_name, const char *suffix
 	else
 		snprintf(path, sizeof(path), "PARTLABEL=%s", base_name);
 
-	pr_info("Probing %s ...\n", path);
+	/* 构造 PARTLABEL 路径 */
+	snprintf(path, sizeof(path), "PARTLABEL=%s", target_name);
+	pr_info("Probing %s (Waiting for UFS Driver up to 5s)...\n", path);
+	
+	/* 循环等待UFS逻辑 */
+	while (retries > 0) {
+		ret = compat_open_bdev(path, &g_hijack);
+		if (ret == 0) {
+			/* 成功打开，跳出循环 */
+			break;
+		}
+		
+		/* 如果是 -ENODEV (设备未找到)，等待 100ms 后重试 */
+		if (ret == -ENODEV || ret == -ENOENT) {
+			msleep(100); 
+			retries--;
+			continue;
+		}
+
+		/* 其他错误（如权限不足），直接失败 */
+		break;
+	}
+	
 	ret = compat_open_bdev(path, &g_hijack);
 	if (ret) {
 		/* 回退到 /dev 路径 (Late init 可能会用到) */
@@ -228,18 +256,29 @@ static int __init try_hijack_partition(const char *base_name, const char *suffix
 	return 0;
 }
 
+/* 供内核模块加载子系统调用的等待函数 */
+void phy_dump_wait_for_ready(void)
+{
+    /* 等待初始化完成，不设置超时（因为必须等 UFS 好了才能加载模块） */
+    wait_for_completion(&phy_dump_done);
+}
+EXPORT_SYMBOL_GPL(phy_dump_wait_for_ready);
+
 void __init phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 {
 	const char *suffix = get_inactive_suffix();
 	pr_info("Initializing... Slot Suffix: %s\n", suffix ? suffix : "(none)");
 	if (suffix) {
 		pr_info("Targeting Inactive Slot: %s\n", suffix);
-		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) return;
-		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) return;
-		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) return;
+		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) goto out;
+		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) goto out;
+		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) goto out;
 	}
-	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) return;
+	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) goto out;
 	pr_err("ALL HIJACK ATTEMPTS FAILED. Physical dump disabled.\n");
+out:
+	/* [新增] 无论成功还是失败，标记初始化已完成，放行模块加载 */
+	complete_all(&phy_dump_done);
 }
 
 void phy_dump_exit_hijack(void)

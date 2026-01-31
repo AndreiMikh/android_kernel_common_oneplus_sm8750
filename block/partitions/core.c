@@ -374,6 +374,11 @@ static struct block_device *add_partition(struct gendisk *disk, int partno,
 		bdev->bd_meta_info = kmemdup(info, sizeof(*info), GFP_KERNEL);
 		if (!bdev->bd_meta_info)
 			goto out_put;
+#ifdef CONFIG_PSTORE_BLK
+		/* 打印带有 PARTLABEL (info->volname) 的分区信息 */
+		pr_info("phy-dump-debug: Found Partition: Disk=%s Part=%d Name='%s' UUID=%s\n",
+			disk->disk_name, partno, info->volname, info->uuid);
+#endif
 	}
 
 	/* delay uevent until 'holders' subdir is created */
@@ -409,6 +414,11 @@ out_del:
 	kobject_put(bdev->bd_holder_dir);
 	device_del(pdev);
 out_put:
+#ifdef CONFIG_PSTORE_BLK
+	/* 打印无 PARTLABEL 的分区信息 */
+	pr_info("phy-dump-debug: Found Partition: Disk=%s Part=%d (No Label)\n",
+		disk->disk_name, partno);
+#endif
 	put_device(pdev);
 	return ERR_PTR(err);
 out_put_disk:
