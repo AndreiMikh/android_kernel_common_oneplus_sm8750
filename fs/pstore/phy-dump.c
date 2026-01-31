@@ -264,17 +264,50 @@ void phy_dump_wait_for_ready(void)
 }
 EXPORT_SYMBOL_GPL(phy_dump_wait_for_ready);
 
+/* * 优先探测的 Raw 分区列表 
+ * 这些通常是厂商预留的调试分区，不带 A/B 后缀，且尾部无重要元数据，最适合覆盖写入。
+ */
+static const char *const priority_raw_partitions[] = {
+	"logdump",
+	"rawdump",
+	"logfs",
+	"oplusreserve1",
+	"oplusreserve3",
+	"oplusreserve4",
+	"oplusreserve5",
+};
+
 void __init phy_dump_init_hijack(char *blkdev_buf, size_t buf_len)
 {
+	int i;
+
+	/* 策略 1: 优先尝试专用的 Raw Dump 分区 (非 A/B) */
+	pr_info("Scanning priority raw partitions...\n");
+	for (i = 0; i < ARRAY_SIZE(priority_raw_partitions); i++) {
+		/* 传入 NULL 后缀，直接匹配分区名 */
+		if (try_hijack_partition(priority_raw_partitions[i], NULL, blkdev_buf, buf_len) == 0)
+			goto out;
+	}
+	pr_info("Scan for all priority raw partitions failed, trying inactive slot partitions...\n");
+	
+	/* 策略 2: 尝试 A/B 机型的非活动槽位 */
 	const char *suffix = get_inactive_suffix();
+	pr_info("Targeting Inactive Slot: %s\n", suffix);
 	pr_info("Initializing... Slot Suffix: %s\n", suffix ? suffix : "(none)");
 	if (suffix) {
 		pr_info("Targeting Inactive Slot: %s\n", suffix);
 		if (try_hijack_partition("boot", suffix, blkdev_buf, buf_len) == 0) goto out;
 		if (try_hijack_partition("dtbo", suffix, blkdev_buf, buf_len) == 0) goto out;
+		if (try_hijack_partition("init_boot", suffix, blkdev_buf, buf_len) == 0) goto out;
 		if (try_hijack_partition("cache", suffix, blkdev_buf, buf_len) == 0) goto out;
+	} else {
+		pr_warn("No A/B slot detected via Bootconfig/DT/Cmdline.\n");
 	}
+	
+	/* 策略 3: 最后尝试通用 Cache 分区 */
+	pr_info("Falling back to generic cache...\n");
 	if (try_hijack_partition("cache", NULL, blkdev_buf, buf_len) == 0) goto out;
+
 	pr_err("ALL HIJACK ATTEMPTS FAILED. Physical dump disabled.\n");
 out:
 	/* [新增] 无论成功还是失败，标记初始化已完成，放行模块加载 */
